@@ -116,6 +116,21 @@ function complementarygenerators(G::FqMatrix)::Tuple{FqMatrix,FqMatrix}
     return G1, G2
 end
 
+@inline function fmttime(secs::Real)
+    s = max(0.0, float(secs))
+    h = floor(Int, s / 3600)
+    s -= 3600h
+    m = floor(Int, s / 60)
+    s -= 60m
+    if h > 0
+        return string(h, "h ", lpad(m, 2, '0'), "m ", lpad(round(Int, s), 2, '0'), "s")
+    elseif m > 0
+        return string(m, "m ", lpad(round(Int, s), 2, '0'), "s")
+    else
+        return string(round(Int, s), "s")
+    end
+end
+
 
 ## --------------------------------------------------------- ##
 ## GPU kernel for computing weights of codewords in parallel ##
@@ -128,13 +143,14 @@ function partialweightskernel(Gt::CuDeviceMatrix{UInt8},
                               hist::CuDeviceVector{UInt64},
                               k::Int, n::Int,
                               t::Int, ttotal::Int,
+                              batchstart::UInt64, batchcount::UInt64,
                               strict::Bool)
     tid    = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = gridDim().x * blockDim().x
 
     # start and end indices for this batch
-    idx   = UInt64(tid - 1)
-    final = UInt64(ttotal)
+    idx   = batchstart + UInt64(tid - 1)
+    final = batchstart + batchcount #UInt64(ttotal)
     step  = UInt64(stride)
 
     cw = MVector{MAXN,UInt8}(undef)
@@ -202,7 +218,7 @@ end
     ub computed using the algorithm of Gaborit-Nedeloaia-Wassermann
     [https://doi.org/10.1109/ISIT.2004.1365525].
 """
-function partialweightdistribution(G::FqMatrix, ub::Int64)
+function partialweightdistribution(G::FqMatrix, ub::Int64, batchsize::Int=10_000_000_000)
     k, n = size(G)
     ub = min(n, 2k, ub)
     G1, G2 = complementarygenerators(G)
@@ -221,25 +237,52 @@ function partialweightdistribution(G::FqMatrix, ub::Int64)
     dhist = CuVector(zeros(UInt64, n+1))
 
     total = 2 * sum(binomial(k,t)*(q-1)^t for t ∈ 1:fld(ub,2))
+    threads = 256
 
     for t ∈ 1:fld(ub, 2)
         ttotal = binomial(k, t) * (q-1)^(t-1)
+        ttotalcodewords = 2 * binomial(k, t) * (q-1)^t
 
-        threads = 256
-        blocks = Int(min(UInt64(65535), cld(ttotal, UInt64(threads))))
+        println("t=$t start: idx-per-half=$ttotal, codewords-this-t=$ttotalcodewords, batchsize=$batchsize")
+        tstart = time()
+        processedidx = UInt64(0)
 
-        @cuda threads=threads blocks=blocks partialweightskernel(dA1tu8,daddtbl,dmultbl,dbintbl,dhist,k,n,t,ttotal,false)
-        synchronize()
+        batchstart = UInt64(0)
+        while batchstart < UInt64(ttotal)
+            batchcount = UInt64(min(batchsize, Int(UInt64(ttotal) - batchstart)))
 
-        println("t=$t half done.")
+            blocks = Int(min(UInt64(65535), cld(batchcount, UInt64(threads))))
 
-        @cuda threads=threads blocks=blocks partialweightskernel(dA2tu8,daddtbl,dmultbl,dbintbl,dhist,k,n,t,ttotal,true)
-        synchronize()
+            # First half (non-strict)
+            @cuda threads=threads blocks=blocks partialweightskernel(
+                dA1tu8, daddtbl, dmultbl, dbintbl, dhist,
+                k, n, t, ttotal,
+                batchstart, batchcount,
+                false
+            )
+            synchronize()
 
+            # Second half (strict)
+            @cuda threads=threads blocks=blocks partialweightskernel(
+                dA2tu8, daddtbl, dmultbl, dbintbl, dhist,
+                k, n, t, ttotal,
+                batchstart, batchcount,
+                true
+            )
+            synchronize()
+
+            processedidx += batchcount
+            elapsed = time() - tstart
+            frac = processedidx / UInt64(ttotal)
+            eta = (frac > 0) ? elapsed * (1 / frac - 1) : Inf
+
+            tcheckedcodewords = 2 * (q-1) * processedidx
+            println("t=$t progress: $(round(100*frac; digits=1))%  idx=$(processedidx)/$(ttotal)  codewords=$(tcheckedcodewords)/$(ttotalcodewords)  elapsed=$(fmttime(elapsed))  eta=$(fmttime(eta))")
+
+            batchstart += batchcount
+        end
         completed = 2 * sum(binomial(k,l)*(q-1)^l for l ∈ 1:t)
-
-        println("Row combinations of size $t done.")
-        println("    $completed / $total codewords checked ($(round(100 * completed / total)))")
+        println("t=$t done. Overall checked: $completed / $total codewords ($(round(100 * completed / total))%)")
     end
 
     hist = Vector{UInt64}(undef, n+1)
